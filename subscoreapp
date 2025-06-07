@@ -1,0 +1,204 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+contract NFTFANSubdropDistributor is Ownable, ReentrancyGuard {
+    IERC20 public nftFanToken;
+    uint256 public constant TOKEN_AMOUNT = 1 * 10**6; // 1 token with 6 decimals
+    uint256 public batchSize = 50;
+    
+    // Subdrop Score System
+    mapping(address => uint256) public subdropScores; // wallet => total successful airdrops sent
+    mapping(address => mapping(address => bool)) public hasSentTo; // sender => recipient => has sent
+    
+    // Leaderboard tracking
+    address[] public activeDroppers;
+    mapping(address => bool) public isActiveDropper;
+    
+    // Events
+    event TokensDistributed(address indexed sender, address indexed recipient, uint256 amount);
+    event SubdropScoreUpdated(address indexed sender, uint256 newScore);
+    event BatchSizeUpdated(uint256 newBatchSize);
+    event TokensWithdrawn(address indexed owner, uint256 amount);
+
+    constructor(address _tokenAddress) Ownable(msg.sender) {
+        nftFanToken = IERC20(_tokenAddress);
+    }
+
+    /**
+     * @dev Allows any wallet to distribute tokens and earn subdrop score
+     * @param recipients Array of addresses to receive tokens
+     */
+    function distributeTokens(address[] calldata recipients) external nonReentrant {
+        require(recipients.length > 0, "No recipients provided");
+        
+        uint256 totalSuccessfulDrops = 0;
+        uint256 totalRecipients = recipients.length;
+        
+        // Check if sender has enough tokens for the distribution
+        uint256 totalNeeded = 0;
+        for (uint256 i = 0; i < totalRecipients; i++) {
+            if (nftFanToken.balanceOf(recipients[i]) == 0 && !hasSentTo[msg.sender][recipients[i]]) {
+                totalNeeded += TOKEN_AMOUNT;
+            }
+        }
+        
+        require(nftFanToken.balanceOf(msg.sender) >= totalNeeded, "Insufficient token balance");
+        require(nftFanToken.allowance(msg.sender, address(this)) >= totalNeeded, "Insufficient allowance");
+        
+        // Process in batches
+        for (uint256 i = 0; i < totalRecipients; i += batchSize) {
+            uint256 end = i + batchSize > totalRecipients ? totalRecipients : i + batchSize;
+            
+            for (uint256 j = i; j < end; j++) {
+                address recipient = recipients[j];
+                
+                // Check conditions for valid airdrop:
+                // 1. Recipient has zero NFTFAN tokens (is a new wallet for NFTFAN)
+                // 2. Sender hasn't already sent to this recipient
+                // 3. Sender is not sending to themselves
+                if (nftFanToken.balanceOf(recipient) == 0 && 
+                    !hasSentTo[msg.sender][recipient] && 
+                    recipient != msg.sender) {
+                    
+                    // Transfer tokens from sender to recipient
+                    require(nftFanToken.transferFrom(msg.sender, recipient, TOKEN_AMOUNT), "Transfer failed");
+                    
+                    // Update tracking
+                    hasSentTo[msg.sender][recipient] = true;
+                    totalSuccessfulDrops++;
+                    
+                    emit TokensDistributed(msg.sender, recipient, TOKEN_AMOUNT);
+                }
+            }
+        }
+        
+        // Update subdrop score
+        if (totalSuccessfulDrops > 0) {
+            subdropScores[msg.sender] += totalSuccessfulDrops;
+            
+            // Add to active droppers list if first time
+            if (!isActiveDropper[msg.sender]) {
+                activeDroppers.push(msg.sender);
+                isActiveDropper[msg.sender] = true;
+            }
+            
+            emit SubdropScoreUpdated(msg.sender, subdropScores[msg.sender]);
+        }
+    }
+
+    /**
+     * @dev Get subdrop score for a specific wallet
+     */
+    function getSubdropScore(address wallet) external view returns (uint256) {
+        return subdropScores[wallet];
+    }
+
+    /**
+     * @dev Get top N wallets by subdrop score
+     */
+    function getTopDroppers(uint256 limit) external view returns (address[] memory topWallets, uint256[] memory scores) {
+        uint256 totalDroppers = activeDroppers.length;
+        if (totalDroppers == 0) {
+            return (new address[](0), new uint256[](0));
+        }
+        
+        uint256 returnLimit = limit > totalDroppers ? totalDroppers : limit;
+        
+        // Create arrays for sorting
+        address[] memory wallets = new address[](totalDroppers);
+        uint256[] memory walletScores = new uint256[](totalDroppers);
+        
+        for (uint256 i = 0; i < totalDroppers; i++) {
+            wallets[i] = activeDroppers[i];
+            walletScores[i] = subdropScores[activeDroppers[i]];
+        }
+        
+        // Simple bubble sort (for small datasets)
+        for (uint256 i = 0; i < totalDroppers - 1; i++) {
+            for (uint256 j = 0; j < totalDroppers - i - 1; j++) {
+                if (walletScores[j] < walletScores[j + 1]) {
+                    // Swap scores
+                    uint256 tempScore = walletScores[j];
+                    walletScores[j] = walletScores[j + 1];
+                    walletScores[j + 1] = tempScore;
+                    
+                    // Swap addresses
+                    address tempAddr = wallets[j];
+                    wallets[j] = wallets[j + 1];
+                    wallets[j + 1] = tempAddr;
+                }
+            }
+        }
+        
+        // Return top N
+        topWallets = new address[](returnLimit);
+        scores = new uint256[](returnLimit);
+        
+        for (uint256 i = 0; i < returnLimit; i++) {
+            topWallets[i] = wallets[i];
+            scores[i] = walletScores[i];
+        }
+        
+        return (topWallets, scores);
+    }
+
+    /**
+     * @dev Check if a wallet currently has zero NFTFAN tokens
+     */
+    function isNewWallet(address wallet) external view returns (bool) {
+        return nftFanToken.balanceOf(wallet) == 0;
+    }
+
+    /**
+     * @dev Check if sender has already sent to a specific recipient
+     */
+    function hasSenderSentToRecipient(address sender, address recipient) external view returns (bool) {
+        return hasSentTo[sender][recipient];
+    }
+
+    /**
+     * @dev Get total number of active droppers
+     */
+    function getTotalActiveDroppers() external view returns (uint256) {
+        return activeDroppers.length;
+    }
+
+    /**
+     * @dev Preview how many successful drops a sender would make
+     */
+    function previewDistribution(address sender, address[] calldata recipients) external view returns (uint256 successfulDrops, uint256 tokensNeeded) {
+        for (uint256 i = 0; i < recipients.length; i++) {
+            address recipient = recipients[i];
+            if (nftFanToken.balanceOf(recipient) == 0 && 
+                !hasSentTo[sender][recipient] && 
+                recipient != sender) {
+                successfulDrops++;
+                tokensNeeded += TOKEN_AMOUNT;
+            }
+        }
+        return (successfulDrops, tokensNeeded);
+    }
+
+    // Owner functions
+    function setBatchSize(uint256 _batchSize) external onlyOwner {
+        require(_batchSize > 0, "Batch size must be greater than zero");
+        batchSize = _batchSize;
+        emit BatchSizeUpdated(_batchSize);
+    }
+
+    function emergencyWithdraw(uint256 amount) external onlyOwner {
+        require(nftFanToken.transfer(owner(), amount), "Withdraw failed");
+        emit TokensWithdrawn(owner(), amount);
+    }
+
+    /**
+     * @dev Reset a sender's record for a specific recipient (emergency function)
+     */
+    function resetSenderRecord(address sender, address recipient) external onlyOwner {
+        hasSentTo[sender][recipient] = false;
+    }
+}
